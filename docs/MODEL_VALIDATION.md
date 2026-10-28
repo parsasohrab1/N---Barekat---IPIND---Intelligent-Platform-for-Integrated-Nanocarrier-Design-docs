@@ -1,0 +1,118 @@
+# Validation of Models and NFRs
+
+> **Main warning:** All accuracy numbers in this document were obtained on **synthetic data** (structure→property rules + noise; `data_generation/properties.py`). They show that the pipeline can *learn* the structure-property relationship, not that it is accurate on real nanoparticles. Real accuracy can only be measured with experimental data or a public dataset (LNP-622/LANCE) — see [`TRL_ASSESSMENT.md`](TRL_ASSESSMENT.md).
+
+Model version: `20261003-release-e99cbd64` (`release` profile: 10,000 training samples, 1,500 holdout, 3-member ensemble). Raw report: [`validation_report.json`](validation_report.json). Hardware: Windows 11, 8-core CPU, no GPU, torch 2.1.1.
+
+## Accuracy (synthetic holdout, n = 1500)
+
+| Requirement | Target | Result | Status | Theoretical ceiling* |
+|---|---|---|---|---|
+| NFR-01 | Size RMSE < 5 nm | **3.27 nm** | ✅ | R² ≤ 0.981 |
+| NFR-02 | Zeta RMSE < 2 mV | **1.59 mV** | ✅ | R² ≤ 0.982 |
+| NFR-03 | Loading R² > 0.85 | **0.868** | ✅ (small margin) | R² ≤ 0.879 |
+| FR-03 | Biological R² > 0.85 for all | Minimum **0.869** (TBR); the rest 0.93–0.98 | ✅ (small margin for TBR) | TBR ≤ 0.882 |
+
+\* Theoretical ceiling = R² of the best possible model that cannot predict the synthetic measurement noise (`noise_ceiling_r2`). **The 0.85 threshold for loading is only ≈0.03 below the data ceiling**; whether NFR-03 holds in this benchmark depends more than anything on the noise level chosen in data generation. On the independent frozen reference set (n=500) the value was 0.862; the 0.006 difference is within sampling error. Therefore NFR-03 is "satisfied but not with strong statistical confidence".
+
+PDI (R² 0.92) and loading content (0.79; ceiling 0.81) are not among the R² > 0.85 requirements.
+
+## Performance (real run on the machine above, without concurrent load)
+
+| Requirement | Target | Measurement | Status |
+|---|---|---|---|
+| NFR-04 | 100k structures in < 10 minutes | **60.9 s**, 100,000 unique, RDKit validity 100% | ✅ |
+| NFR-05 | < 100 ms per structure | **5.4 ms** (both models, ensemble of 3) | ✅ |
+| NFR-06 | Optimization of 1000 candidates < 1 hour | **19.5 s** for 1,981 candidates (without MD) | ✅ |
+| NFR-08 | ≥ 1M structures | Template-based space of 2,540,780 | ✅ |
+| NFR-10 | Seed ≥ 1M reference structures from public databases | 1,000,000 built (556 s) but **0 structures from PubChem/ZINC** | ⚠️ Size yes, public origin no |
+| NFR-07 | Availability 99.9% | Not provable by code (infrastructure) | — |
+| NFR-09 | Quasi-quantum < 1 kcal/mol | Only an xtb adapter; accuracy not measured | ❌ Not validated |
+
+The NFR-06 measurement **does not include MD**.
+
+## Benchmark on real public data
+
+Dataset: LANTERN/AGILE HeLa — 1100 ionizable lipids with **experimental** transfection efficiency (`data/AGILE.csv`, [MIT repo](https://github.com/AsalMehradfar/LANTERN); the file is not shipped with the repo, download it into `data/external/`). LNP-622 has no direct public file and LANCE is available only on request from its authors; neither was run.
+
+### Path to improvement (including the failed steps)
+
+1. **First version (no fingerprints):** R² = **0.30** — worse than RandomForest+Morgan (0.48). Negative finding: the 0.97 accuracy on synthetic data did not generalise to real data.
+2. **Fix:** count-based Morgan fingerprints (log1p) were appended to the global features (`GraphEncoder(fp_bits=...)`; default 0, so existing models and saved bundles are unchanged and still load).
+3. **Config chosen on a validation split** (20% of training, seed 0; the test set was not looked at): fp ∈ {0, 512, 1024, 2048, 4096}, dropout ∈ {0.05 … 0.5}. Validation R²: 0.26 without fingerprints → 0.47–0.54 with them; best `fp=2048, dropout=0.3` (0.54). Differences among the fingerprint configs are noise-sized; the gain comes from *having* fingerprints, not from fine tuning.
+4. **Final evaluation on 5 fresh splits** (seeds 1–5, not used for tuning), 3-member ensemble:
+
+| Model | RMSE | R² |
+|---|---|---|
+| Constant mean | 3.368 ± 0.108 | −0.011 ± 0.013 |
+| RandomForest + Morgan | 2.456 ± 0.131 | 0.459 ± 0.069 |
+| Platform GNN **without** fingerprints | 2.807 ± 0.103 | 0.297 ± 0.028 |
+| **Platform GNN + Morgan(2048)** | **2.345 ± 0.116** | **0.507 ± 0.053** |
+| LANTERN paper: MLP (Morgan+Expert) | — | 0.8161 |
+| Paper: AGILE | — | 0.2655 |
+
+Paired over the 5 splits: GNN+Morgan beats the RandomForest on **5 of 5** splits (mean R² difference +0.049, sd 0.022, paired t-test p = 0.008) and beats the no-fingerprint GNN by about +0.21 (p = 0.004). n = 5 is small; the advantage over the RandomForest is **small but consistent**.
+
+### What is not claimed
+
+- It is still **far below** the 0.82 reported by the paper. The paper's split/cleaning protocol differs and we did not investigate the gap; parity with the paper is not claimed.
+- This dataset does not measure the platform's own properties (size, zeta, IC50, ...); their validity on real data remains unknown. Morgan fingerprints were only enabled in this experiment: the `release` bundle was trained without them (retraining and re-validation are needed).
+- The R2 criterion in `trl.py` is only "≥ simple RandomForest baseline" and is now met; that is a low bar.
+
+Reproduce: `python -m ipind2.benchmarking.public` (output: `docs/public_benchmark.json` with per-split results, recorded in `benchmarks/history.json`).
+
+## Real MD runs (FR-05, criterion R3)
+
+Engine: OpenMM 8.6.1 in a separate conda env (`ipind-md`), OpenCL on the laptop GPU (MX450). Model: **OpenFF 2.2.0 "Sage" force field, Gasteiger partial charges, OBC2 implicit solvent**, one solute molecule, Langevin 310 K, 2 fs, 100 ps equilibration, frames every 10 ps. The three top pipeline candidates (lipid query, `release` bundle) were simulated for **2 ns each**:
+
+| # | Atoms | Simulated (ns) | Rg (Å) | SASA (Å²) | S₂ (C–C) | ns/day | Stable |
+|---|---|---|---|---|---|---|---|
+| 1 | 162 | 2 | 5.84 ± 0.32 | 1217 | 0.015 | 137 | ✅ |
+| 2 | 216 | 2 | 6.30 ± 0.32 | 1394 | 0.006 | 125 | ✅ |
+| 3 | 221 | 2 | 6.49 ± 0.47 | 1419 | 0.007 | 144 | ✅ |
+
+(Report: `docs/md_validation.json`; reproduce with `python -m ipind2.md_simulation.campaign`. "Stable" = Rg coefficient of variation < 0.35, a crude screen, not a chemical threshold. Candidate 3 crashed on its first attempt while writing its output file — the machine slept — and was re-run with identical settings.)
+
+**What this does show:** the engine integration works on real pipeline output; geometries stay physical (C–C bonds ≈ 1.5 Å, tested), energies are finite and the molecules do not blow up; throughput is 125–144 ns/day, so 100 ns takes about 17–19 hours per candidate here.
+
+**What it does not show:**
+- **Not 100 ns** — 2 ns is 2% of the requirement, so `complete = false` and criterion R3 stays unmet.
+- Not CHARMM36/OPLS-AA, not explicit water, no self-assembled particle or bilayer, no binding free energy / MM-GBSA. A single flexible chain in implicit solvent mostly collapses/relaxes; Rg and SASA from it say little about nanoparticle stability.
+- Gasteiger charges are cruder than AM1-BCC (AmberTools has no Windows build), so electrostatics for charged/polar heads is less reliable.
+- Metals (Au, Fe, Si, ...) are rejected: Sage has no parameters for them.
+- Only 3 candidates from one query; no comparison against experiment.
+
+## Requirements without full validation
+
+- **FR-05 (MD ≥ 100 ns, CHARMM36):** partially validated — see "Real MD runs" below: real MD works end to end, but only 2 ns per candidate (not 100 ns), with Sage/Gasteiger/implicit solvent instead of CHARMM36/OPLS-AA explicit solvent.
+- **FR-12 comparison with papers:** `published_results.json` must be filled with real citations; we have not supplied any number of our own.
+
+## Validation findings that changed the code
+
+| Finding | Root cause | Fix |
+|---|---|---|
+| The main data generator produced random descriptors for **all** samples (~150 distinct SMILES out of 100k) | `Descriptors.FractionCsp3` does not exist + a blanket `except` | Rewritten; regression test |
+| `generate_for_gnn` assigned the first row's target to all graphs | Bug | Per-sample target; test |
+| Quaternary ammonium was almost never generated | Template weight ∝ space size ⇒ one template ≈95% of lipids | Uniform weight + 3 cationic templates |
+| NFR-04 failed on first measurement: only 79,200 of 100,000 | Saturation of small templates | Adaptive weighting; regression test that **fails** with the old sampler (confirmed) |
+| Loading a saved model raised an error | `load` ignored the subclass signature | Construct from base initialization |
+| A concurrent API request could corrupt batches | `GraphEncoder` has per-call state | Lock + concurrency test |
+| Impossible constraints ⇒ `KeyError` | Empty table columns | Uniform schema |
+| Log and failed-login counter were lost on rollback | Error inside the transaction | Commit before the 401 response + test |
+
+## Negative finding: active learning
+
+Under severe distribution shift (model trained on lipids, new data polymer, 30 results): fine-tuning reduces normalized size error from ≈3.5 to ≈0.9. But **uncertainty-based sampling was not better than random selection** (size: random ≈0.9, pure uncertainty ≈1.7); outliers were selected. The `hybrid` strategy (half random) was ≈ random on size/loading and better and more stable on zeta (1.34 vs. 2.22, 3 seeds). The default is `hybrid`; superiority of pure uncertainty is not claimed.
+
+## How to reproduce
+
+```bash
+python -m ipind2.training.train --profile release --out models/v1     # ~35 minutes on CPU
+python -m ipind2.training.validate --model-dir models/v1 --out docs/validation_report.json --seed-library
+python -m ipind2.trl --tests-passed yes
+pytest -q                                                              # 345 tests
+```
+
+## Trusting the tests
+
+The security tests (account lockout, RBAC) and the template-saturation regression were checked with a **mutation check**: when the logic was deliberately broken, the related tests failed. (One regression test was initially ineffective without this check and was fixed.)
